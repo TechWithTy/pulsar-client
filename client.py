@@ -6,19 +6,31 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from datetime import datetime
 
-import pulsar  # Official Pulsar (sync) client
+# Check if Pulsar is enabled before importing dependencies
+PULSAR_ENABLED = os.getenv("PULSAR_ENABLED", "true").lower() == "true"
+
+# Only import Pulsar dependencies if enabled
+if PULSAR_ENABLED:
+    import pulsar  # Official Pulsar (sync) client
+
 from circuitbreaker import CircuitBreakerError, circuit
 from prometheus_client import Counter, Gauge, Histogram
 
 from app.core.pulsar.config import PulsarConfig
-from app.core.telemetry.client import TelemetryClient
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-telemetry = TelemetryClient(service_name="pulsar_client")
+# Only create telemetry client if Pulsar is enabled
+telemetry = None
+if PULSAR_ENABLED:
+    from app.core.telemetry.client import TelemetryClient
+    # Use the main service name from settings instead of "pulsar_client"
+    telemetry = TelemetryClient(service_name=getattr(settings, "PROJECT_NAME", "FastAPI Connect"))
 
 # Metrics
 PULSAR_BATCH_SIZE = Gauge("pulsar_batch_size", "Size of Pulsar message batches")
@@ -106,19 +118,36 @@ class PulsarClient:
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
-    # Circuit breaker configuration
-    CB_FAILURE_THRESHOLD = 5
-    CB_RECOVERY_TIMEOUT = 30
+    # Circuit breaker configuration - fail fast for disabled Pulsar
+    CB_FAILURE_THRESHOLD = 1  # Fail after just 1 failure
+    CB_RECOVERY_TIMEOUT = 1   # Only wait 1 second before trying again
     CB_EXPECTED_EXCEPTION = (ConnectionError, TimeoutError)
 
-    def __init__(self, service_url: str = None, max_retries: int = 3, retry_delay: float = 5.0):
+    def __init__(self, service_url: str = None, max_retries: int = 2, retry_delay: float = 0.1):
         """
         Initialize PulsarClient using the official async Apache Pulsar Python client.
         """
         if service_url is None:
             service_url = PulsarConfig.SERVICE_URL
         self.service_url = service_url
-        self._client = pulsar.Client(self.service_url)
+        try:
+            # Add fast timeout configuration to fail quickly when Pulsar is not available
+            self._client = pulsar.Client(
+                self.service_url,
+                connection_timeout_ms=2000,  # 2 seconds instead of default 10 seconds
+                operation_timeout_seconds=3,  # 3 seconds for operations
+                io_threads=1,  # Minimize resources
+                message_listener_threads=1,  # Minimize resources
+                concurrent_lookup_requests=1,  # Minimize resources
+                log_conf_file_path=None,  # Disable detailed logging to reduce overhead
+                use_tls=True if "pulsar+ssl" in service_url else False
+            )
+        except AttributeError as e:
+            logger.error(f"Failed to initialize Pulsar.Client: {e}")
+            self._client = None
+        except Exception as e:
+            logger.error(f"Failed to connect to Pulsar (timeout after 2s): {e}")
+            self._client = None
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._batch = []
@@ -158,7 +187,14 @@ class PulsarClient:
                 producer = self._client.create_producer(topic)
                 producer.close()
                 return True
-            return await asyncio.to_thread(sync_check)
+            # Add timeout to prevent hanging
+            return await asyncio.wait_for(
+                asyncio.to_thread(sync_check), 
+                timeout=1.0  # 1 second timeout for health check
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[PulsarClient] Health check timeout after 1s")
+            return False
         except Exception as exc:
             # ! Log for diagnostics
             logger.warning(f"[PulsarClient] Health check failed: {exc}")
@@ -179,25 +215,45 @@ class PulsarClient:
         if not topic:
             raise ValueError("Message must include a 'topic' field")
         start_time = time.time()
+        
         def sync_send():
-            producer = self._client.create_producer(topic)
-            producer.send(json.dumps(message).encode('utf-8'))
-            producer.close()
-            return True
-        result = await asyncio.to_thread(sync_send)
-        duration = time.time() - start_time
-        PULSAR_MESSAGE_LATENCY.labels(topic=topic).observe(duration)
-        return result
-        """Send a single message to Pulsar."""
-        async with self._client as session:
-            with telemetry.span_pulsar_operation("send_message", {"topic": topic}):
-                response = await session.post(
-                    f"{self._base_url}/topics/{topic}/messages",
-                    json=message,
-                    headers={"Content-Type": "application/json"},
-                )
-                response.raise_for_status()
-                # [Pulsar Cache] count cache set operation when message stored in broker
+            producer = None
+            try:
+                producer = self._client.create_producer(topic)
+                producer.send(json.dumps(message).encode('utf-8'))
+                return True
+            except Exception as e:
+                # Handle specific connection issues
+                if "connection" in str(e).lower() or "must redial" in str(e).lower():
+                    logger.warning(f"Pulsar connection issue for topic {topic}: {e}")
+                    raise ConnectionError(f"Pulsar connection failed: {e}")
+                raise
+            finally:
+                if producer:
+                    try:
+                        producer.close()
+                    except:
+                        pass  # Ignore close errors
+        
+        try:
+            # Use timeout to prevent blocking
+            result = await asyncio.wait_for(
+                asyncio.to_thread(sync_send), 
+                timeout=0.5  # 500ms timeout for fast failure
+            )
+            duration = time.time() - start_time
+            PULSAR_MESSAGE_LATENCY.labels(topic=topic).observe(duration)
+            return result
+        except asyncio.TimeoutError:
+            duration = time.time() - start_time
+            PULSAR_MESSAGE_LATENCY.labels(topic=topic).observe(duration)
+            logger.warning(f"Pulsar send timeout after 0.5s for topic {topic}")
+            raise TimeoutError(f"Pulsar send timeout for topic {topic}")
+        except Exception as e:
+            duration = time.time() - start_time
+            PULSAR_MESSAGE_LATENCY.labels(topic=topic).observe(duration)
+            logger.error(f"Pulsar send error for topic {topic}: {e}")
+            raise
 
     async def send_batch(self, topic: str) -> None:
         """Async-compatible: send batch of messages to Pulsar using sync client in a thread."""
